@@ -1,0 +1,64 @@
+tickers:
+  equities:
+    - SPY
+    - QQQ
+    - VTI
+    - IWM
+    - IWDA.AS
+    - EUNL.DE
+  bonds:
+    - IEF
+    - TLT
+    - AGG
+    - BND
+    - SHY
+  alternatives:
+    - GLD
+    - DJP
+    - TIP
+  cash_proxy:
+    - SHY
+  market_overview:
+    - SPY
+    - QQQ
+    - IEF
+    - TLT
+    - SHY
+  benchmarks:
+    - SPY
+    - AGG
+    - QQQ
+  # Macro regime proxies (all downloadable via yfinance)
+  macro_proxies:
+    - SPY    # Growth proxy (US equity)
+    - QQQ    # Growth / tech
+    - TLT    # Long-duration bonds
+    - IEF    # Medium-duration bonds
+    - SHY    # Short-duration / cash
+    - GLD    # Gold (safe haven + inflation)
+    - TIP    # TIPS (inflation-protected bonds)
+    - HYG    # High yield (credit / risk appetite)
+    - DJP    # Commodities (Bloomberg index ETN)
+
+default_portfolio:
+  tickers:
+    - SPY
+    - IEF
+  weights:
+    - 0.60
+    - 0.40
+  rebalance_freq: monthly
+  benchmark: SPY
+
+default_backtest:
+  equity_ticker: SPY
+  bond_ticker: IEF
+  risk_ticker: SPY
+  ma_window: 200
+
+settings:
+  default_start_date: "2019-01-01"
+  risk_free_rate: 0.04
+  trading_days_per_year: 252
+  ma_short: 50
+  ma_long: 200

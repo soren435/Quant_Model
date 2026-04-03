@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  quant-model:
+    build: .
+    image: quant-model:latest
+    container_name: quant-model
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env                  # loads SAXO_* variables
+    volumes:
+      - ./logs:/app/logs      # persist execution logs outside container
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

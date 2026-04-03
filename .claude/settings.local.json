@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python3 -c \"\nimport sys, os\nsys.path.insert\\(0, '.'\\)\n\nfrom src.utils import format_pct, parse_tickers, parse_weights, date_to_str, get_period_label\nfrom src.metrics import summary_stats, drawdown_series, rolling_volatility, cumulative_returns_series\n\nimport unittest.mock as m\nsys.modules['streamlit'] = m.MagicMock\\(\\)\n\nfrom src.data_ingest import download_prices\nfrom src.portfolio import build_portfolio_returns, correlation_matrix\nfrom src.backtest import run_strategies, trend_filter_returns\nfrom src.plots import plot_price_history, plot_cumulative_returns, plot_drawdown\n\nprint\\('All imports resolved successfully.'\\)\n\")"
+    ]
+  }
+}
