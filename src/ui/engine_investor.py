@@ -15,6 +15,7 @@ from src.engines.investor_profile import (
     profile_from_score,
     backtest_profile_allocation,
     compare_all_profiles,
+    efficient_frontier,
 )
 from src.analytics.risk import drawdown_series
 from src.analytics.returns import cumulative_returns_series
@@ -23,6 +24,7 @@ from src.visualization.charts import (
     plot_drawdown,
     plot_allocation_pie,
     plot_bar_returns,
+    plot_efficient_frontier,
     COLORS,
 )
 from src.utils.formatting import format_pct
@@ -275,6 +277,71 @@ def render_engine_investor(
                     "Max DD":       format_pct(ss.get("Max Drawdown", 0)),
                 })
             st.dataframe(pd.DataFrame(rows).set_index("Profile"), use_container_width=True)
+
+    st.divider()
+
+    # ── Step 5: Efficient frontier ────────────────────────────────────────────
+    st.subheader("Step 5 — Efficient Frontier")
+    st.caption(
+        "Where does your profile sit in risk/return space? "
+        "The frontier shows every possible combination of your assets. "
+        "The optimiser finds the portfolio that maximises Sharpe ratio."
+    )
+
+    ef_tickers = list({t for t in profile.target_allocation if t in prices.columns})
+    target_vol_input = abs(profile.max_drawdown_tolerance) / 2  # rough proxy
+
+    show_ef = st.button("📐 Run Efficient Frontier", type="primary", use_container_width=False)
+    if show_ef:
+        with st.spinner("Optimising… (300 portfolios + scipy SLSQP)"):
+            try:
+                ef = efficient_frontier(
+                    prices[ef_tickers],
+                    rf_annual=rf_annual,
+                    n_portfolios=400,
+                    target_vol=target_vol_input,
+                )
+            except Exception as exc:
+                st.error(f"Optimisation failed: {exc}")
+                ef = {}
+
+        if ef:
+            # Profile's own vol/ret for comparison dot
+            profile_vol = s.get("Annualized Volatility")
+            profile_ret = s.get("Annualized Return")
+
+            st.plotly_chart(
+                plot_efficient_frontier(
+                    ef,
+                    profile_vol=profile_vol,
+                    profile_ret=profile_ret,
+                    profile_label=f"{profile.label} (current)",
+                    title=f"Efficient Frontier — {', '.join(ef_tickers)}",
+                ),
+                use_container_width=True,
+            )
+
+            # Show optimised allocations
+            opt_col1, opt_col2, opt_col3 = st.columns(3)
+            for col, key, label in [
+                (opt_col1, "max_sharpe", "Max Sharpe"),
+                (opt_col2, "min_vol",    "Min Volatility"),
+                (opt_col3, "target_vol", f"Target Vol ({target_vol_input*100:.0f}%)"),
+            ]:
+                port = ef.get(key)
+                if not port:
+                    col.caption(f"_{label}: not available_")
+                    continue
+                with col:
+                    st.markdown(f"**{label}**")
+                    st.metric("Ann. Return", format_pct(port["ret"]))
+                    st.metric("Ann. Vol",    format_pct(port["vol"]))
+                    st.metric("Sharpe",      f"{port['sharpe']:.2f}")
+                    w_clean = {t: w for t, w in port["weights"].items() if w > 0.01}
+                    st.plotly_chart(
+                        plot_allocation_pie(w_clean, title=""),
+                        use_container_width=True,
+                    )
 
     with st.expander("📖 How risk scoring works"):
         st.markdown("""

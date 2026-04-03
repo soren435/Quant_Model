@@ -356,3 +356,99 @@ def plot_bar_returns(
     fig.update_xaxes(title_text=metric, ticksuffix="%")
     fig.update_layout(showlegend=False)
     return fig
+
+
+# ── Efficient Frontier ─────────────────────────────────────────────────────────
+
+def plot_efficient_frontier(
+    ef_result: dict,
+    profile_vol:    float | None = None,
+    profile_ret:    float | None = None,
+    profile_label:  str = "Your Profile",
+    title: str = "Efficient Frontier",
+) -> go.Figure:
+    """
+    Scatter plot of random portfolios coloured by Sharpe ratio,
+    with Max Sharpe, Min Vol, and optional target-vol portfolios highlighted.
+
+    Args:
+        ef_result:    Dict returned by efficient_frontier().
+        profile_vol:  Annualised vol of the investor's current profile allocation.
+        profile_ret:  Annualised return of the investor's current profile allocation.
+        profile_label: Label for the profile dot.
+    """
+    frontier = ef_result.get("frontier")
+    if frontier is None or frontier.empty:
+        return go.Figure()
+
+    fig = go.Figure(layout=_layout(title))
+
+    # Random portfolio cloud — coloured by Sharpe
+    fig.add_trace(go.Scatter(
+        x=frontier["vol"] * 100,
+        y=frontier["ret"] * 100,
+        mode="markers",
+        marker=dict(
+            size=5,
+            color=frontier["sharpe"],
+            colorscale="Viridis",
+            showscale=True,
+            colorbar=dict(title="Sharpe", thickness=12, len=0.6),
+            opacity=0.6,
+        ),
+        name="Random portfolios",
+        hovertemplate="Vol: %{x:.1f}%  Ret: %{y:.1f}%<extra></extra>",
+    ))
+
+    # Special portfolios
+    specials = [
+        ("max_sharpe", "⭐ Max Sharpe",  COLORS[2], "star",    14),
+        ("min_vol",    "🛡 Min Vol",      COLORS[0], "diamond", 12),
+        ("target_vol", "🎯 Target Vol",   COLORS[4], "circle",  12),
+    ]
+    for key, label, color, symbol, size in specials:
+        port = ef_result.get(key)
+        if not port:
+            continue
+        fig.add_trace(go.Scatter(
+            x=[port["vol"] * 100],
+            y=[port["ret"] * 100],
+            mode="markers+text",
+            marker=dict(size=size, color=color, symbol=symbol,
+                        line=dict(width=2, color="white")),
+            text=[label],
+            textposition="top center",
+            textfont=dict(size=10, color=color),
+            name=label,
+            hovertemplate=(
+                f"<b>{label}</b><br>"
+                f"Vol: {port['vol']*100:.1f}%<br>"
+                f"Return: {port['ret']*100:.1f}%<br>"
+                f"Sharpe: {port['sharpe']:.2f}"
+                "<extra></extra>"
+            ),
+        ))
+
+    # Current profile allocation dot
+    if profile_vol is not None and profile_ret is not None:
+        fig.add_trace(go.Scatter(
+            x=[profile_vol * 100],
+            y=[profile_ret * 100],
+            mode="markers+text",
+            marker=dict(size=14, color=COLORS[1], symbol="x",
+                        line=dict(width=2, color="white")),
+            text=[profile_label],
+            textposition="top center",
+            textfont=dict(size=10, color=COLORS[1]),
+            name=profile_label,
+            hovertemplate=(
+                f"<b>{profile_label}</b><br>"
+                f"Vol: {profile_vol*100:.1f}%<br>"
+                f"Return: {profile_ret*100:.1f}%"
+                "<extra></extra>"
+            ),
+        ))
+
+    fig.update_xaxes(title_text="Annualised Volatility (%)", ticksuffix="%")
+    fig.update_yaxes(title_text="Annualised Return (%)",     ticksuffix="%")
+    return fig
