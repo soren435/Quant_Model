@@ -1,47 +1,30 @@
 """
 UI — Saxo Bank Connect tab.
 
-Guides the user through the full OAuth2 authorization-code flow:
-  1. Enter client_id / client_secret (or confirm they are in .env)
-  2. Click "Connect" → open Saxo login page
-  3. Saxo redirects back to http://localhost:8501/?code=XXX
-  4. This page auto-detects the code, exchanges it for tokens, persists them
-  5. Shows live account info + balance + token expiry countdown
-
-Also supports manual token entry (paste from Saxo Developer Portal) as a
-quick fallback when client credentials are not available.
+PKCE OAuth2 flow (no client secret, RFC 7636 S256):
+  1. User clicks "Connect to Saxo Bank" → PKCE session generated, stored in
+     session_state, browser directed to Saxo authorize URL.
+  2. Saxo redirects back to http://localhost:8501/?code=XXX&state=YYY.
+  3. This page detects the callback, validates state, exchanges code for token.
+  4. TokenData stored in st.session_state["saxo_token"].
+  5. Authenticated view shows token expiry + live account/balance data.
 """
 from __future__ import annotations
-import os
-import time
-from pathlib import Path
 
 import streamlit as st
 
-from src.integrations.saxo_auth import SaxoAuth
-from src.integrations.saxo_client import SaxoClient
-
-_ENV_FILE = Path(__file__).parent.parent.parent / ".env"
+from src.integrations.saxo.auth import (
+    PKCESession,
+    TokenData,
+    build_authorize_url,
+    exchange_code,
+    new_pkce_session,
+)
+from src.integrations.saxo.client import SaxoApiClient
+from src.integrations.saxo.config import SaxoConfig, is_configured, load_config
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _write_env_pair(key: str, value: str) -> None:
-    """Write/update a key in .env without disturbing other lines."""
-    try:
-        from dotenv import set_key
-        set_key(str(_ENV_FILE), key, value, quote_mode="never")
-        os.environ[key] = value
-    except Exception:
-        pass
-
-
-def _get_auth() -> SaxoAuth:
-    """Return a cached SaxoAuth instance stored in Streamlit session state."""
-    if "saxo_auth" not in st.session_state:
-        st.session_state.saxo_auth = SaxoAuth()
-    return st.session_state.saxo_auth
-
 
 def _status_badge(label: str, colour: str) -> None:
     colour_map = {
@@ -58,247 +41,222 @@ def _status_badge(label: str, colour: str) -> None:
     )
 
 
+def _token() -> TokenData | None:
+    return st.session_state.get("saxo_token")
+
+
+def _pkce_session() -> PKCESession | None:
+    return st.session_state.get("saxo_pkce")
+
+
 # ── Main render ────────────────────────────────────────────────────────────────
 
 def render_saxo_connect(lang: str = "en") -> None:
     st.header("🔗 Saxo Bank — Connect")
     st.caption(
-        "Connect to your Saxo Bank account via OAuth2. "
-        "All trades remain in simulation mode unless you explicitly switch to live."
+        "Connect to your Saxo Bank SIM account using PKCE OAuth2 (no client secret required). "
+        "All activity is in simulation mode."
     )
 
-    auth = _get_auth()
-
-    # ── Handle OAuth2 callback (code in URL) ──────────────────────────────────
-    params = st.query_params
-    if "code" in params:
-        code  = params["code"]
-        state = params.get("state", None)
-        st.query_params.clear()
-
-        with st.spinner("Exchanging authorization code for tokens…"):
-            try:
-                tokens = auth.exchange_code(code, state)
-                st.success(
-                    f"✅ Connected! Token valid until **{tokens.expires_at_str}** "
-                    f"({tokens.seconds_remaining}s remaining). "
-                    f"Refresh token {'stored ✓' if tokens.refresh_token else 'not returned'}."
-                )
-                st.session_state.saxo_auth = auth
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Token exchange failed: {exc}")
+    # ── Step 0: Check env configuration ───────────────────────────────────────
+    if not is_configured():
+        st.error(
+            "**SAXO_CLIENT_ID** is not set.\n\n"
+            "1. Register your app at [developer.saxobank.com](https://developer.saxobank.com)\n"
+            "2. Set redirect URI to `http://localhost:8501/`\n"
+            "3. Add `SAXO_CLIENT_ID=your_id` to your `.env` file and restart the app"
+        )
+        st.subheader("Required environment variables")
+        st.code(
+            "SAXO_CLIENT_ID=your_app_client_id\n"
+            "# Optional overrides (defaults shown):\n"
+            "SAXO_REDIRECT_URI=http://localhost:8501/\n"
+            "SAXO_AUTH_BASE=https://sim.logonvalidation.net\n"
+            "SAXO_OPENAPI_BASE=https://gateway.saxobank.com/sim/openapi",
+            language="bash",
+        )
         return
 
-    # ── Current status ────────────────────────────────────────────────────────
-    status = auth.status()
-    client = SaxoClient()
-    conn   = client.status()
+    config: SaxoConfig = load_config()
+
+    # ── Step 1: Handle OAuth2 callback (?code=...&state=...) ──────────────────
+    params = st.query_params
+    if "code" in params:
+        code      = params["code"]
+        state_got = params.get("state", "")
+        st.query_params.clear()
+
+        pkce = _pkce_session()
+        if pkce is None:
+            st.error(
+                "PKCE session not found in browser session. "
+                "The login page may have been opened in a different tab or the "
+                "session was reset. Please click **Connect to Saxo Bank** again."
+            )
+            return
+
+        if state_got != pkce.state:
+            st.error(
+                f"State mismatch — possible CSRF attempt. "
+                f"Expected `{pkce.state[:8]}…`, got `{state_got[:8]}…`. "
+                "Please try connecting again."
+            )
+            del st.session_state["saxo_pkce"]
+            return
+
+        with st.spinner("Exchanging authorization code for access token…"):
+            try:
+                token = exchange_code(config, code, pkce.code_verifier)
+                st.session_state["saxo_token"] = token
+                del st.session_state["saxo_pkce"]
+            except Exception as exc:
+                st.error(f"Token exchange failed: {exc}")
+                return
+
+        st.success("Authentication successful — redirecting…")
+        st.rerun()
+        return
+
+    # ── Authenticated view ─────────────────────────────────────────────────────
+    token = _token()
+
+    if token and not token.is_expired:
+        _render_connected(config, token)
+        return
+
+    if token and token.is_expired:
+        st.warning(
+            "Your Saxo token has expired. Please reconnect.",
+        )
+        del st.session_state["saxo_token"]
+
+    # ── Not connected — show Connect button ───────────────────────────────────
+    _render_login(config)
+
+
+def _render_login(config: SaxoConfig) -> None:
+    """Show the PKCE login button and redirect instructions."""
+    st.subheader("Connection Status")
+    col_badge, _ = st.columns([1, 3])
+    with col_badge:
+        _status_badge("Not connected", "grey")
+
+    st.divider()
+    st.subheader("OAuth2 Login (PKCE)")
+    st.write(
+        "Click the button below to open the Saxo Bank login page. "
+        "After logging in you will be redirected back here automatically."
+    )
+    st.caption(
+        f"Redirect URI: `{config.redirect_uri}` — "
+        "must match your app registration at developer.saxobank.com"
+    )
+
+    # Generate a fresh PKCE session each time the button might be shown
+    if "saxo_pkce" not in st.session_state:
+        st.session_state["saxo_pkce"] = new_pkce_session()
+
+    pkce: PKCESession = st.session_state["saxo_pkce"]
+    authorize_url = build_authorize_url(config, pkce)
+
+    st.link_button(
+        "🔐 Connect to Saxo Bank",
+        url=authorize_url,
+        type="primary",
+        use_container_width=True,
+    )
+
+    with st.expander("How this works"):
+        st.markdown("""
+**PKCE OAuth2 flow (RFC 7636):**
+
+1. A random `code_verifier` is generated and stored in your browser session.
+2. A `code_challenge` = SHA-256(code_verifier) is sent to Saxo in the authorize URL.
+3. After you log in, Saxo redirects back here with `?code=...&state=...`.
+4. This app exchanges the code + original verifier for an access token.
+5. No client secret is needed — your identity is proven by the verifier.
+
+**Token lifetime:** ~20 minutes (Saxo SIM). You will be asked to reconnect when it expires.
+        """)
+
+
+def _render_connected(config: SaxoConfig, token: TokenData) -> None:
+    """Show connected status, token expiry, and a live API test call."""
+    mins, secs = divmod(token.seconds_remaining, 60)
+    expiry_colour = "green" if token.seconds_remaining > 120 else "orange"
 
     st.subheader("Connection Status")
-    s_col, i_col = st.columns([1, 2])
-
-    with s_col:
-        if conn["authenticated"]:
-            _status_badge(conn["label"], "green")
-        elif conn["state"] == "not_connected":
-            _status_badge(conn["label"], "grey")
-        elif conn["state"] == "auth_error":
-            _status_badge(conn["label"], "red")
-        else:
-            _status_badge(conn["label"], "orange")
-
+    col_badge, col_expiry = st.columns([1, 2])
+    with col_badge:
+        _status_badge("Connected ✓", "green")
         st.write("")
-        st.caption(f"Environment: **{status['env'].upper()}**")
-        st.caption(f"Gateway: `{conn['base_url']}`")
+        st.caption(f"Gateway: `{config.openapi_base}`")
+    with col_expiry:
+        st.metric(
+            "Token expires at",
+            token.expires_at_local,
+            delta=f"{mins}m {secs}s remaining",
+            delta_color="normal" if expiry_colour == "green" else "inverse",
+        )
 
-    with i_col:
-        if auth.has_tokens():
-            t = auth._tokens
-            remaining = t.seconds_remaining if t else 0
-            mins, secs = divmod(remaining, 60)
-            if remaining > 120:
-                st.metric("Token expires", t.expires_at_str if t else "—",
-                          delta=f"{mins}m {secs}s remaining")
-            else:
-                st.metric("Token expires", "Refreshing…", delta=f"{remaining}s left",
-                          delta_color="inverse")
-
-            has_refresh = bool(t and t.refresh_token)
-            st.caption(f"Refresh token: {'✅ stored' if has_refresh else '❌ not available (manual token)'}")
-        else:
-            st.info("No token loaded. Complete the OAuth2 flow below.")
+    if st.button("🔓 Disconnect", type="secondary"):
+        del st.session_state["saxo_token"]
+        st.rerun()
 
     st.divider()
 
-    # ── Account + balance (when connected) ────────────────────────────────────
-    if conn["authenticated"] or conn["state"] == "sim_api":
-        st.subheader("Account")
-        account = client.get_account_info()
-        balance = client.get_cash_balance()
+    # ── Live API test call ─────────────────────────────────────────────────────
+    client = SaxoApiClient(token, config.openapi_base)
 
-        a1, a2, a3, a4 = st.columns(4)
-        a1.metric("Account ID", account.get("AccountId", "—"))
-        a2.metric("Currency",   account.get("Currency", "—"))
-        a3.metric(
-            "Cash Balance",
-            f"{balance.get('cash') or balance['raw'].get('CashBalance', 0):,.0f}",
-            delta=balance.get("currency", ""),
-        )
-        a4.metric("Mode", conn["state"].upper().replace("_", " "))
+    st.subheader("Account Overview")
+    try:
+        user_info = client.get_user_info()
+        accounts  = client.get_accounts()
+        balance   = client.get_balance()
 
-        if conn["state"] != "sim_api":
-            st.warning(
-                "⚠️ You are connected to the **live** gateway. "
-                "Orders placed here will involve real money."
-            )
+        # User info row
+        u1, u2, u3 = st.columns(3)
+        u1.metric("Name",       user_info.get("Name", "—"))
+        u2.metric("Client key", user_info.get("ClientKey", "—")[:12] + "…"
+                  if len(user_info.get("ClientKey", "")) > 12
+                  else user_info.get("ClientKey", "—"))
+        u3.metric("Accounts",   len(accounts))
 
-        st.divider()
+        # Balance row
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("Cash balance",    f"{balance.get('CashBalance', 0):,.2f}")
+        b2.metric("Net equity",      f"{balance.get('NetEquityForMargin', balance.get('TotalValue', 0)):,.2f}")
+        b3.metric("Margin available",f"{balance.get('MarginAvailableForTrading', 0):,.2f}")
+        b4.metric("Currency",        balance.get("Currency", "—"))
 
-    # ── OAuth2 flow ────────────────────────────────────────────────────────────
-    st.subheader("OAuth2 Authorization")
+        # Accounts table
+        if accounts:
+            st.write("**Accounts**")
+            rows = [
+                {
+                    "Account ID":  a.get("AccountId", "—"),
+                    "Account key": a.get("AccountKey", "—"),
+                    "Currency":    a.get("Currency", "—"),
+                    "Type":        a.get("AccountType", "—"),
+                    "Active":      "✅" if a.get("Active", True) else "❌",
+                }
+                for a in accounts
+            ]
+            st.dataframe(rows, use_container_width=True)
 
-    tab_oauth, tab_manual, tab_setup = st.tabs(
-        ["🔐 OAuth2 Login", "📋 Paste Token", "⚙️ App Setup"]
-    )
-
-    # ── Tab 1: Full OAuth2 flow ────────────────────────────────────────────────
-    with tab_oauth:
-        if not status["configured"]:
-            st.warning(
-                "**SAXO_CLIENT_ID** and **SAXO_CLIENT_SECRET** are not set. "
-                "Register your app at [developer.saxobank.com](https://developer.saxobank.com) "
-                "or paste your credentials in the **App Setup** tab."
-            )
-        else:
-            st.write(
-                "Click the button below to open the Saxo login page. "
-                "After logging in, Saxo will redirect back here automatically."
-            )
-            st.caption(
-                f"Redirect URI: `{status['redirect_uri']}` "
-                "(must match your app registration)"
-            )
-
-            if st.button("🔐 Connect to Saxo Bank", type="primary", use_container_width=True):
-                url, state = auth.get_authorization_url()
-                st.session_state.saxo_auth = auth  # persist pending_state
-                st.markdown(
-                    f"**[→ Click here to log in to Saxo Bank]({url})**\n\n"
-                    "_After logging in you will be redirected back to this page._",
-                    unsafe_allow_html=False,
-                )
-                st.info(
-                    "If the redirect does not happen automatically, copy the full "
-                    "URL from the browser after login and paste it into the "
-                    "address bar as `http://localhost:8501/?code=...`"
-                )
-
-            # Manual refresh button
-            if auth.has_tokens() and auth._tokens and auth._tokens.refresh_token:
-                st.write("")
-                if st.button("🔄 Refresh token now", type="secondary"):
-                    try:
-                        tokens = auth.refresh()
-                        st.success(
-                            f"Token refreshed. New expiry: **{tokens.expires_at_str}** "
-                            f"({tokens.seconds_remaining}s remaining)."
-                        )
-                        st.session_state.saxo_auth = auth
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Refresh failed: {exc}")
-
-    # ── Tab 2: Manual token paste ─────────────────────────────────────────────
-    with tab_manual:
-        st.caption(
-            "Use this if you have a fresh token from "
-            "[developer.saxobank.com](https://developer.saxobank.com) "
-            "or a custom auth flow. Note: no refresh token — expires in ~20 minutes."
-        )
-        with st.form("manual_token_form"):
-            pasted = st.text_area(
-                "Paste access token",
-                height=120,
-                placeholder="eyJhbGciOiJFUzI1NiIsIn...",
-                help="Bearer token from Saxo Developer Portal or your own OAuth flow.",
-            )
-            submitted = st.form_submit_button("Apply token", type="primary")
-
-        if submitted and pasted.strip():
+        # Open positions
+        with st.expander("Open positions"):
             try:
-                auth.set_manual_token(pasted.strip())
-                st.session_state.saxo_auth = auth
-                t = auth._tokens
-                st.success(
-                    f"Token applied. Expires at **{t.expires_at_str}** "
-                    f"({t.seconds_remaining}s remaining). "
-                    "No refresh token — re-paste when it expires."
-                )
-                st.rerun()
+                positions = client.get_positions()
+                if positions:
+                    st.dataframe(positions, use_container_width=True)
+                else:
+                    st.info("No open positions.")
             except Exception as exc:
-                st.error(f"Could not parse token: {exc}")
+                st.warning(f"Could not load positions: {exc}")
 
-    # ── Tab 3: App setup ──────────────────────────────────────────────────────
-    with tab_setup:
-        st.markdown("""
-**How to register a Saxo app** (one-time setup):
-
-1. Go to [developer.saxobank.com](https://developer.saxobank.com) → **My Apps** → **Create app**
-2. Set the redirect URI to: `http://localhost:8501/`
-3. Copy **Client ID** and **Client Secret**
-4. Paste them below — they will be saved to your `.env` file
-        """)
-
-        with st.form("app_credentials_form"):
-            env_opt = st.radio(
-                "Environment",
-                options=["sim", "live"],
-                index=0 if os.getenv("SAXO_ENV", "sim") == "sim" else 1,
-                horizontal=True,
-                help="'sim' = simulation gateway, no real money. 'live' = real account.",
-            )
-            client_id = st.text_input(
-                "Client ID",
-                value=os.getenv("SAXO_CLIENT_ID", ""),
-                type="password",
-            )
-            client_secret = st.text_input(
-                "Client Secret",
-                value=os.getenv("SAXO_CLIENT_SECRET", ""),
-                type="password",
-            )
-            redirect_uri = st.text_input(
-                "Redirect URI",
-                value=os.getenv("SAXO_REDIRECT_URI", "http://localhost:8501/"),
-                help="Must exactly match the redirect URI in your Saxo app registration.",
-            )
-            save = st.form_submit_button("💾 Save to .env", type="primary")
-
-        if save:
-            if client_id:
-                _write_env_pair("SAXO_CLIENT_ID", client_id)
-            if client_secret:
-                _write_env_pair("SAXO_CLIENT_SECRET", client_secret)
-            if redirect_uri:
-                _write_env_pair("SAXO_REDIRECT_URI", redirect_uri)
-            _write_env_pair("SAXO_ENV", env_opt)
-
-            # Reinitialise auth with new credentials
-            st.session_state.saxo_auth = SaxoAuth()
-            st.success("Credentials saved to `.env`. Ready to connect.")
-            st.rerun()
-
-        st.divider()
-        st.subheader("Current .env values")
-        env_display = {
-            "SAXO_ENV":          os.getenv("SAXO_ENV", "—"),
-            "SAXO_CLIENT_ID":    "✅ set" if os.getenv("SAXO_CLIENT_ID") else "❌ not set",
-            "SAXO_CLIENT_SECRET":"✅ set" if os.getenv("SAXO_CLIENT_SECRET") else "❌ not set",
-            "SAXO_REDIRECT_URI": os.getenv("SAXO_REDIRECT_URI", "—"),
-            "SAXO_ACCESS_TOKEN": "✅ set" if os.getenv("SAXO_ACCESS_TOKEN") else "❌ not set",
-            "SAXO_REFRESH_TOKEN":"✅ set" if os.getenv("SAXO_REFRESH_TOKEN") else "❌ not set",
-            "SAXO_TOKEN_EXPIRY": os.getenv("SAXO_TOKEN_EXPIRY", "—"),
-        }
-        for k, v in env_display.items():
-            st.caption(f"`{k}`: {v}")
+    except Exception as exc:
+        st.error(
+            f"API call failed: {exc}\n\n"
+            "Your token may be invalid or the SIM gateway may be unreachable."
+        )
