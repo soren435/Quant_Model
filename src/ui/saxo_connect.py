@@ -159,18 +159,19 @@ def _render_login(config: SaxoConfig) -> None:
         f"Redirect URI: `{config.redirect_uri}` — must match your app registration at developer.saxobank.com"
     )
 
-    # Always create a fresh PKCE session when user clicks connect
-    if st.button("🔐 Connect to Saxo Bank", type="primary", use_container_width=True):
-        pkce: PKCESession = new_pkce_session()
-        st.session_state["saxo_pkce"] = pkce
-        authorize_url = build_authorize_url(config, pkce)
+    # Create PKCE session before rendering the button (link_button needs pre-computed URL)
+    if "saxo_pkce" not in st.session_state:
+        st.session_state["saxo_pkce"] = new_pkce_session()
 
-        # Redirect in the same tab to preserve browser session
-        st.markdown(
-            f'<script>window.location.href = "{authorize_url}";</script>',
-            unsafe_allow_html=True,
-        )
-        st.stop()
+    pkce: PKCESession = st.session_state["saxo_pkce"]
+    authorize_url = build_authorize_url(config, pkce)
+
+    st.link_button(
+        "🔐 Connect to Saxo Bank",
+        url=authorize_url,
+        type="primary",
+        use_container_width=True,
+    )
 
     with st.expander("How this works"):
         st.markdown(
