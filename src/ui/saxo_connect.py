@@ -17,6 +17,7 @@ from src.integrations.saxo.auth import (
     PKCESession,
     TokenData,
     build_authorize_url,
+    consume_pkce_session,
     exchange_code,
     new_pkce_session,
 )
@@ -88,10 +89,13 @@ def render_saxo_connect(lang: str = "en") -> None:
 
         pkce = _pkce_session()
         if pkce is None:
+            # Session state lost during redirect — fall back to server-side store
+            pkce = consume_pkce_session(state_got)
+
+        if pkce is None:
             st.error(
-                "PKCE session not found in browser session. "
-                "The login page may have been opened in a different tab or the "
-                "session was reset. Please click **Connect to Saxo Bank** again."
+                "PKCE session not found. "
+                "Please click **Connect to Saxo Bank** again."
             )
             return
 

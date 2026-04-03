@@ -81,12 +81,24 @@ class PKCESession:
     state:         str
 
 
+# Module-level store so PKCE sessions survive Streamlit session resets
+# that happen when the browser redirects away and back during OAuth.
+_pkce_store: dict[str, "PKCESession"] = {}
+
+
 def new_pkce_session() -> PKCESession:
-    """Generate a fresh PKCE session (verifier + state nonce)."""
-    return PKCESession(
+    """Generate a fresh PKCE session and register it in the server-side store."""
+    session = PKCESession(
         code_verifier=generate_code_verifier(),
         state=generate_state(),
     )
+    _pkce_store[session.state] = session
+    return session
+
+
+def consume_pkce_session(state: str) -> "PKCESession | None":
+    """Look up and remove a PKCE session from the server-side store by state."""
+    return _pkce_store.pop(state, None)
 
 
 # ── Step 1: Build authorize URL ────────────────────────────────────────────────
